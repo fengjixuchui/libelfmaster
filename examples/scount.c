@@ -1,7 +1,6 @@
 /*
  * Prints the dynamic symbol names with the corresponding PLT address
- * Same as plt_dump, but uses the dynamic symbol iterator
- * and then looks up each symbol name via the PLT cache.
+ * Same as plt_dump2, but uses the plt iterator.
  */
 
 #define _GNU_SOURCE
@@ -17,10 +16,6 @@ int main(int argc, char **argv)
 {
 	elfobj_t obj;
 	elf_error_t error;
-	elf_dynsym_iterator_t iter;
-	struct elf_symbol symbol;	
-	struct elf_plt plt;
-	
 
 	if (argc < 2) {
 		printf("Usage: %s <binary>\n", argv[0]);
@@ -30,12 +25,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "%s\n", elf_error_msg(&error));
 		return -1;
 	}
-	elf_dynsym_iterator_init(&obj, &iter);
-	while (elf_dynsym_iterator_next(&iter, &symbol) == ELF_ITER_OK) {
-		if (elf_plt_by_name(&obj, symbol.name, &plt) == true)
-			printf("%#08lx %s\n", plt.addr, plt.symname);
-	}
-	printf("Closing object\n");
-	elf_close_object(&obj);
+	printf("Number of sections: %zu\n", elf_section_count(&obj));
 	return 0;
 }

@@ -54,26 +54,6 @@
 	(((addr) + __alignof__ (struct cache_file_new) -1)	\
 	    & (~(__alignof__ (struct cache_file_new) - 1)))
 
-size_t
-elf_segment_count(elfobj_t *obj)
-{
-
-	switch(obj->e_class) {
-	case elfclass32:
-		return obj->ehdr32->e_phnum;
-	case elfclass64:
-		return obj->ehdr64->e_phnum;
-	}
-	return 0;
-}
-
-size_t
-elf_section_count(elfobj_t *obj)
-{
-
-	return obj->section_count;
-}
-
 bool
 elf_symtab_count(elfobj_t *obj, uint64_t *count)
 {
@@ -354,6 +334,41 @@ bool elf_segment_modify(elfobj_t *obj, uint64_t index,
 	return true;
 }
 
+/*
+ * If bool extend == true, then the function allows the caller to add a dynamic
+ * entry that extends beyond the known size of the dynamic section. This often
+ * works to allow atleast two or three extra entries depending on the padding
+ * between .dynamic and the following section.
+ */
+bool
+elf_dynamic_modify(elfobj_t *obj, uint64_t index, struct elf_dynamic_entry *dyn,
+    bool extend, elf_error_t *error)
+{
+
+	if ((obj->load_flags & ELF_LOAD_F_MODIFY) == false) {
+		return elf_error_set(error,
+		    "elf_dynamic_modify() requires ELF_LOAD_F_MODIFY be set\n");
+	}
+
+	if (extend == false && index >= elf_dtag_count(obj)) {
+		return elf_error_set(error,
+		    "dynamic entry index: %zu outside of range\n", index);
+	}
+	switch(obj->e_class) {
+	case elfclass32:
+		obj->dynamic32[index].d_tag = dyn->tag;
+		obj->dynamic32[index].d_un.d_val = dyn->value;
+		break;
+	case elfclass64:
+		obj->dynamic64[index].d_tag = dyn->tag;
+		obj->dynamic64[index].d_un.d_val = dyn->value;
+		break;
+	default:
+		return elf_error_set(error, "unknown elfclass: %d\n", obj->e_class);
+	}
+	return true;
+}
+
 bool
 elf_section_commit(elfobj_t *obj)
 {
@@ -524,6 +539,38 @@ elf_linking_type(elfobj_t *obj)
 }
 
 size_t
+elf_ehdr_size(elfobj_t *obj)
+{
+
+	switch(elf_class(obj)) {
+	case elfclass32:
+		return sizeof(Elf32_Ehdr);
+		break;
+	case elfclass64:
+		return sizeof(Elf64_Ehdr);
+		break;
+	}
+	return 0;
+}
+
+ssize_t
+elf_phdr_table_size(elfobj_t *obj)
+{
+	size_t tbl_size;
+
+	switch(elf_class(obj)) {
+	case elfclass32:
+		tbl_size = obj->ehdr32->e_phentsize * obj->ehdr32->e_phnum;
+		break;
+	case elfclass64:
+		tbl_size = obj->ehdr64->e_phentsize * obj->ehdr64->e_phnum;
+		break;
+	default:
+		return -1;
+	}
+	return tbl_size;
+}
+size_t
 elf_data_filesz(elfobj_t *obj)
 {
 
@@ -538,6 +585,8 @@ elf_text_filesz(elfobj_t *obj)
 }
 
 /*
+ * If its not a SCOP binary it calls elf_text_filesz()
+ * If its a SCOP binary:
  * Gets the sum total of all 3 LOAD segments for SCOP
  * binaries.
  */
@@ -549,6 +598,9 @@ elf_scop_text_filesz(elfobj_t *obj)
 	uint32_t count = 0;
 	size_t total = 0;
 
+	if (peu_probable(elf_flags(obj, ELF_SCOP_F) == false)) {
+		return elf_text_base(obj);
+	}
 	elf_segment_iterator_init(obj, &iter);
 	for (;;) {
 		elf_iterator_res_t res;
@@ -571,20 +623,20 @@ elf_scop_text_filesz(elfobj_t *obj)
 }
 
 const char *
-elf_pathname(elfobj_t *obj)
+elf_pathname(struct elfobj *obj)
 {
 
 	return obj->path;
 }
 
 const char *
-elf_basename(elfobj_t *obj)
+elf_basename(struct elfobj *obj)
 {
 	char *ptr;
 
-	ptr = strrchr(obj->path, '\n');
+	ptr = strrchr(obj->path, '/');
 	if (ptr != NULL)
-		ptr += 1;
+		return ptr + 1;
 	return NULL;
 }
 
@@ -821,6 +873,43 @@ elf_reloc_type_string(struct elfobj *obj, uint32_t r_type)
 }
 
 /*
+ * Get a phdr segment by index
+ */
+bool
+elf_segment_by_index(struct elfobj *obj, uint64_t index, struct elf_segment *segment)
+{
+
+	switch(elf_class(obj)) {
+	case elfclass32:
+		if (index >= obj->ehdr32->e_phnum)
+			return false;
+		segment->type = obj->phdr32[index].p_type;
+		segment->flags = obj->phdr32[index].p_flags;
+		segment->offset = obj->phdr32[index].p_offset;
+		segment->vaddr = obj->phdr32[index].p_vaddr;
+		segment->paddr = obj->phdr32[index].p_paddr;
+		segment->filesz = obj->phdr32[index].p_filesz;
+		segment->memsz = obj->phdr32[index].p_memsz;
+		segment->align = obj->phdr32[index].p_align;
+		break;
+	case elfclass64:
+		if (index >= obj->ehdr64->e_phnum)
+			return false;
+		segment->type = obj->phdr64[index].p_type;
+		segment->flags = obj->phdr64[index].p_flags;
+		segment->offset = obj->phdr64[index].p_offset;
+		segment->vaddr = obj->phdr64[index].p_vaddr;
+		segment->paddr = obj->phdr64[index].p_paddr;
+		segment->filesz = obj->phdr64[index].p_filesz;
+		segment->memsz = obj->phdr64[index].p_memsz;
+		segment->align = obj->phdr64[index].p_align;
+		break;
+	default:
+		return false;
+	}
+	return true;
+}
+/*
  * Return executable text segment offset
  * for SCOP binaries
  */
@@ -963,6 +1052,31 @@ elf_data_offset(struct elfobj *obj)
 		}
 	}
 	return 0;
+}
+
+bool
+elf_data_segment(struct elfobj *obj, struct elf_segment *segment)
+{
+	size_t i;
+	bool res = false;
+
+	for (i = 0; i < obj->load_count; i++) {
+		if (obj->pt_load[i].flag & ELF_PT_LOAD_DATA_F) {
+			switch(obj->e_class) {
+			case elfclass32:
+				memcpy(segment, &obj->pt_load[i].phdr32, sizeof(*segment));
+				res = true;
+				break;
+			case elfclass64:
+				memcpy(segment, &obj->pt_load[i].phdr64, sizeof(*segment));
+				res = true;
+				break;
+			default:
+				return false;
+			}
+		}
+	}
+	return res;
 }
 
 void *
@@ -2416,28 +2530,17 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 				if (text_found == false && obj->phdr32[i].p_flags == PF_R) {
 					if (obj->phdr32[i + 1].p_flags == PF_R|PF_X &&
 					    obj->phdr32[i + 2].p_flags == PF_R) {
+						/*
+						 * SCOP binary with 3 LOAD's for the text
+						 * segment.
+						 */
 						obj->flags |= ELF_SCOP_F;
 						text_found = true;
 						obj->pt_load[obj->load_count].flag |= ELF_PT_LOAD_TEXT_F;
+						obj->pt_load[obj->load_count].flag |= ELF_PT_LOAD_TEXT_RDONLY_F;
 						obj->pt_load[obj->load_count + 1].flag |= ELF_PT_LOAD_TEXT_F;
-						obj->pt_load[obj->load_count + 1].flag |= ELF_PT_LOAD_TEXT_RDONLY_F;
 						obj->pt_load[obj->load_count + 2].flag |= ELF_PT_LOAD_TEXT_F;
 						obj->pt_load[obj->load_count + 2].flag |= ELF_PT_LOAD_TEXT_RDONLY_F;
-						/*
-						 * Consider a SCOP (Secure code partitioning) scenario
-						 * where all of the read-only sections are prepended before
-						 * the executable sections, and therefore there are only
-						 * two segments that make up the text segment instead of
-						 * three. This is a hypothetical but conceievable linking
-						 * configuration. SCOP is very new, and currently is in
-						 * the order of 3 PT_LOAD segments; the first being PF_R
-						 * the second being PF_R|PF_X and the 3rd being PF_R, this
-						 * supports the conventional order of the ELF sections from
-						 * a historic standpoint and will probably stay this way
-						 * for quite a while, but we must atleast be prepared for
-						 * other variations of this, and even more than what we are
-						 * currently doing here:
-						 */
 						obj->text_address = obj->phdr32[i].p_vaddr;
 						obj->text_segment_filesz = obj->phdr32[i].p_filesz;
 
@@ -2450,13 +2553,12 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 						i += 2;
 						obj->load_count += 3;
 						continue;
-					} else if (obj->phdr32[i + 1].p_flags == PF_R|PF_X &&
-							/*
-							 * Assuming the next segment would be the
-							 * data segment, hence PF_R|PF_W, and the
-							 * two segments before it SCOP text segments.
-							 */
+					} else if (text_found == false && obj->phdr32[i + 1].p_flags == PF_R|PF_X &&
 						    obj->phdr32[i + 2].p_flags == PF_R|PF_W) {
+						/*
+						 * SCOP binary with only 2 LOAD's for the text
+						 * segment
+						 */
 							text_found = true;
 							obj->flags |= ELF_SCOP_F;
 							obj->pt_load[obj->load_count].flag |= ELF_PT_LOAD_TEXT_F;
@@ -2466,8 +2568,8 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 							obj->text_segment_filesz = obj->phdr32[i].p_filesz;
 							memcpy(&obj->pt_load[obj->load_count].phdr32,
 							    &obj->phdr32[i], sizeof(Elf32_Phdr));
-							memcpy(&obj->pt_load[obj->load_count].phdr32,
-							    &obj->phdr32[i], sizeof(Elf32_Phdr));
+							memcpy(&obj->pt_load[obj->load_count + 1].phdr32,
+							    &obj->phdr32[i + 1], sizeof(Elf32_Phdr));
 							i += 1;
 							obj->load_count += 2;
 							continue;
@@ -2517,6 +2619,7 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 					memcpy(&obj->pt_load[obj->load_count++].phdr32,
 					    &obj->phdr32[i], sizeof(Elf32_Phdr));
 					obj->data_segment_filesz = obj->phdr32[i].p_filesz;
+					obj->data_address = obj->phdr32[i].p_vaddr;
 				}
 
 			}
@@ -2720,16 +2823,20 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 				   if (text_found == false && obj->phdr64[i].p_flags == PF_R) {
 					if (obj->phdr64[i + 1].p_flags == PF_R|PF_X &&
 					    obj->phdr64[i + 2].p_flags == PF_R) {
+						/*
+						 * separate-code SCOP binary with 3 LOAD's for
+						 * the text segment alone.
+						 */
 						obj->flags |= ELF_SCOP_F;
 						text_found = true;
 						obj->pt_load[obj->load_count].flag |= ELF_PT_LOAD_TEXT_F;
+						obj->pt_load[obj->load_count].flag |= ELF_PT_LOAD_TEXT_RDONLY_F;
 						obj->pt_load[obj->load_count + 1].flag |= ELF_PT_LOAD_TEXT_F;
-						obj->pt_load[obj->load_count + 1].flag |= ELF_PT_LOAD_TEXT_RDONLY_F;
 						obj->pt_load[obj->load_count + 2].flag |= ELF_PT_LOAD_TEXT_F;
 						obj->pt_load[obj->load_count + 2].flag |= ELF_PT_LOAD_TEXT_RDONLY_F;
 						obj->text_address = obj->phdr64[i].p_vaddr;
 						obj->text_segment_filesz = obj->phdr64[i].p_filesz;
-						memcpy(&obj->pt_load[obj->load_count++].phdr64, &obj->phdr64[i],
+						memcpy(&obj->pt_load[obj->load_count].phdr64, &obj->phdr64[i],
 						    sizeof(Elf64_Phdr));
 						memcpy(&obj->pt_load[obj->load_count + 1].phdr64,
 						  &obj->phdr64[i + 1], sizeof(Elf64_Phdr));
@@ -2738,24 +2845,30 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 						i += 2;
 						obj->load_count += 3;
 						continue;
-					} else if (obj->phdr64[i + 1].p_flags == PF_R|PF_X &&
+					} else if (text_found == false && obj->phdr64[i + 1].p_flags == PF_R|PF_X &&
 						    obj->phdr64[i + 2].p_flags == PF_R|PF_W) {
+							/*
+							 * SCOP binary with only 2 LOAD's for the
+							 * text segment.
+							 */
 							text_found = true;
 							obj->flags |= ELF_SCOP_F;
 							obj->pt_load[obj->load_count].flag |= ELF_PT_LOAD_TEXT_F;
+							obj->pt_load[obj->load_count].flag |= ELF_PT_LOAD_TEXT_RDONLY_F;
 							obj->pt_load[obj->load_count + 1].flag |= ELF_PT_LOAD_TEXT_F;
-							obj->pt_load[obj->load_count + 1].flag |= ELF_PT_LOAD_TEXT_RDONLY_F;
 							obj->text_address = obj->phdr64[i].p_vaddr;
 							obj->text_segment_filesz = obj->phdr64[i].p_filesz;
 							memcpy(&obj->pt_load[obj->load_count].phdr64,
 							    &obj->phdr64[i], sizeof(Elf64_Phdr));
-							memcpy(&obj->pt_load[obj->load_count].phdr64,
-							    &obj->phdr64[i], sizeof(Elf64_Phdr));
+							memcpy(&obj->pt_load[obj->load_count + 1].phdr64,
+							    &obj->phdr64[i + 1], sizeof(Elf64_Phdr));
 							i += 1;
 							obj->load_count += 2;
 							continue;
 					}
 				}
+				/*
+				 * Traditional single LOAD text segment */
 				obj->pt_load[obj->load_count].flag |= ELF_PT_LOAD_TEXT_F;
 				text_found = true;
 				memcpy(&obj->pt_load[obj->load_count++].phdr64, &obj->phdr64[i],
@@ -2791,6 +2904,7 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 					memcpy(&obj->pt_load[obj->load_count++].phdr64,
 					    &obj->phdr64[i], sizeof(Elf64_Phdr));
 					obj->data_segment_filesz = obj->phdr64[i].p_filesz;
+					obj->data_address = obj->phdr64[i].p_vaddr;
 				}
 			}
 			if (data_found == false) {
@@ -2941,12 +3055,19 @@ final_load_stages:
 
 	/*
 	 * must get the eh_frame ranges before calling build_symtab_data
-	 * incase we need to reconstruct symbol information from the FDE's
+	 * incase we need to reconstruct symbol information from the FDE's.
+	 * We should only be needing to get the FDE ranges if there are insane
+	 * section headers, otherwise there will be no need for us to parse
+	 * .eh_frame; the sole purpose if dw_get_eh_frame_ranges is to get
+	 * the data necessary to reconstruct .symtab.
 	 */
-	if ((obj->flags & ELF_EH_FRAME_F) != 0) {
-		if (dw_get_eh_frame_ranges(obj) < 0) {
-			elf_error_set(error, "failed to build FDE data from eh_frame");
-			goto err;
+	if (insane_section_headers(obj) == true &&
+            (load_flags & ELF_LOAD_F_FORENSICS)) {
+		if ((obj->flags & ELF_EH_FRAME_F) != 0) {
+			if (dw_get_eh_frame_ranges(obj) < 0) {
+				elf_error_set(error, "failed to build FDE data from eh_frame");
+				goto err;
+			}
 		}
 	}
 	if (build_dynsym_data(obj) == false) {
