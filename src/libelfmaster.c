@@ -599,7 +599,7 @@ elf_scop_text_filesz(elfobj_t *obj)
 	size_t total = 0;
 
 	if (peu_probable(elf_flags(obj, ELF_SCOP_F) == false)) {
-		return elf_text_base(obj);
+		return elf_text_filesz(obj);
 	}
 	elf_segment_iterator_init(obj, &iter);
 	for (;;) {
@@ -909,6 +909,29 @@ elf_segment_by_index(struct elfobj *obj, uint64_t index, struct elf_segment *seg
 	}
 	return true;
 }
+
+/*
+ * Get a phdr segment by p_type
+ */
+bool
+elf_segment_by_p_type(struct elfobj *obj, uint64_t type, struct elf_segment *segment)
+{
+	elf_segment_iterator_t p_iter;
+
+	elf_segment_iterator_init(obj, &p_iter);
+	for (;;) {
+		elf_iterator_res_t ires = elf_segment_iterator_next(&p_iter, segment);
+		if (ires == ELF_ITER_ERROR)
+			break;
+		if (ires == ELF_ITER_DONE)
+			break;
+		if (segment->type == type) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /*
  * Return executable text segment offset
  * for SCOP binaries
@@ -1128,10 +1151,40 @@ elf_symtab_string(struct elfobj *obj, uint64_t offset)
 	return &obj->strtab[offset];
 }
 
+bool
+elf_section_index_by_name(struct elfobj *obj, const char *name,
+    uint64_t *index)
+{
+	size_t shnum = elf_shnum(obj);
+	size_t i;
+
+	for (i = 0; i < shnum; i++) {
+		if (elf_class(obj) == elfclass32) {
+			if (strcmp(&obj->shstrtab[obj->shdr32[i].sh_name],
+			    name) == 0) {
+				*index = i;
+				return true;
+			}
+		} else if (elf_class(obj) == elfclass64) {
+			if (strcmp(&obj->shstrtab[obj->shdr64[i].sh_name],
+			    name) == 0) {
+				*index = i;
+				return true;
+			}
+		}
+	}
+	return false;
+}
 /*
- * Ultimately we should store sections in a cache too, no
+ * TODO Ultimately we should store sections in a cache too, no
  * point in adding the complexity of a binary search 'logN'
- * when we can have 'O(1)'
+ * when we can have 'O(1)' We should also store the sections
+ * in a list and set a flag for when there are more than one
+ * of the same section name, in which case the list should
+ * be traversed instead of using the binary search or cache
+ * which can't contain duplicates. Or better yet we could
+ * create a chained hash map. See how writing comments can
+ * work you through problems?
  */
 bool
 elf_section_by_name(struct elfobj *obj, const char *name,
@@ -1545,6 +1598,50 @@ elf_shared_object_iterator_next(struct elf_shared_object_iterator *iter,
     struct elf_shared_object *entry, elf_error_t *error)
 {
 	bool result;
+
+	entry->path = NULL;
+
+	/*
+	 * TODO rewrite this ELF_SO_LDSO_FAST_F
+	 * chunk of code so that it uses a while loop
+	 * instead of a goto to ldso_fast. This type
+	 * of special casing gets sloppy.
+	 */
+	if (iter->flags & ELF_SO_LDSO_FAST_F) {
+		entry->path = ldd_parse_line(iter);
+
+		/*
+		 * If a line is yielded with linux-vdso.so.1, it
+		 * should have no full path, so confirm that there
+		 * is no '/' character, and then follow up with a
+		 * strstr call to be certain we have found linux-vdso.so.*
+		 */
+		if ((iter->flags & ELF_SO_IGNORE_VDSO_F) && entry->path != NULL
+		    && strchr(entry->path, '/') == NULL) {
+			if (strstr(entry->path, "linux-vdso") != NULL) {
+				entry->path = ldd_parse_line(iter);
+				if (entry->path == NULL)
+					return ELF_ITER_DONE;
+				entry->basename = strchr(entry->path, '/');
+				if (entry->basename != NULL) {
+					entry->basename += 1;
+				} else {
+					entry->basename = entry->path;
+				}
+			}
+		}
+		if (entry->path != NULL) {
+			entry->basename = strrchr(entry->path, '/');
+			if (entry->basename != NULL) {
+				entry->basename += 1;
+			} else {
+				entry->basename = entry->path;
+			}
+			return ELF_ITER_OK;
+		}
+		free(iter->chunk);
+		return ELF_ITER_DONE;
+	}
 
 	if (iter->current == NULL && LIST_EMPTY(&iter->yield_list)) {
 		ldso_cleanup(iter);
@@ -2623,7 +2720,7 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 				}
 
 			}
-			if (data_found == false) {
+			if (data_found == false && obj->load_count >= (size_t)obj->ehdr32->e_phnum - 1) {
 				obj->pt_load[possible_merge_index].flag = ELF_PT_LOAD_DATA_F|ELF_PT_LOAD_TEXT_F|
 				    ELF_PT_LOAD_MERGED_F;
 				obj->flags |= ELF_MERGED_SEGMENTS_F;
@@ -2817,7 +2914,7 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 				}
 			} else if (obj->phdr64[i].p_type == PT_LOAD && obj->phdr64[i].p_offset == 0) {
 				/*
-				 * NOTE: Read coments in the i386 PT_LOAD parsing above
+				 * NOTE: Read comments in the i386 PT_LOAD parsing above
 				 * as it applies to this next chunk of code here as well for x64.
 				 */
 				   if (text_found == false && obj->phdr64[i].p_flags == PF_R) {
@@ -2907,7 +3004,7 @@ elf_open_object(const char *path, struct elfobj *obj, uint64_t load_flags,
 					obj->data_address = obj->phdr64[i].p_vaddr;
 				}
 			}
-			if (data_found == false) {
+			if (data_found == false && obj->load_count >= (size_t)obj->ehdr64->e_phnum - 1) {
 				obj->pt_load[possible_merge_index].flag = ELF_PT_LOAD_DATA_F|ELF_PT_LOAD_TEXT_F|
 				    ELF_PT_LOAD_MERGED_F;
 				obj->flags |= ELF_MERGED_SEGMENTS_F;

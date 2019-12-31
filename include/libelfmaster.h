@@ -29,6 +29,7 @@
 
 #include <elf.h>
 #include <link.h>
+#include <limits.h>
 #include <stdint.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -81,6 +82,9 @@
 #define MAX_VALID_SHNUM 65535 - 1
 
 #define SYMTAB_RECONSTRUCT_COUNT 8192
+
+#define ELF_ERRNO_INVALMAGIC	0
+#define ELF_ERRNO_INVALSHDRS	1
 
 typedef struct elf_error {
 	char string[MAX_ERROR_STR_LEN];
@@ -495,19 +499,41 @@ typedef struct elf_relocation_iterator {
 } elf_relocation_iterator_t;
 
 /*
- * Resolve basenames to full paths using ld.so.cache parsing
+ * Resolve top-level basenames to full paths using ld.so.cache parsing
  */
 #define ELF_SO_RESOLVE_F (1 << 0)
 /*
  * Get all dependencies recursively
  */
 #define ELF_SO_RESOLVE_ALL_F (1 << 1)
+/*
+ * Piggy back on top of the dynamic linkers own functionality
+ * to print transitively resolved shared library paths
+ * to stdout with environment variable LD_TRACE_LOADED_OBJECTS
+ * This flag currently only supports complete resolution-- meaning
+ * that it will resolve all shared library dependencies for a
+ * binary, and not just the top-level shared libs who's basenames
+ * exist in the dynamic segment as DT_NEEDED entries. This
+ * is significantly faster performing than the ELF_SO_RESOLVE_F_ALL
+ * flag, and cannot be used in conjunction with ELF_SO_RESOLVE_F.
+ */
+#define ELF_SO_LDSO_FAST_F (1 << 2)
+
+/*
+ * Use this flag to ignore VDSO since it will not actually
+ * have a full path. Combine this flag with ELF_SO_LDSO_FAST_F
+ * since that is the only flag that will yield the vdso
+ * basename.
+ */
+#define ELF_SO_IGNORE_VDSO_F (1 << 3)
 
 typedef struct elf_shared_object_iterator {
 	unsigned int index;
 	elfobj_t *obj;
 	int fd;
 	void *mem;
+	char *chunk;
+	FILE *pd;
 	struct stat st;
 	struct cache_file *cache;
 	struct cache_file_new *cache_new;
@@ -556,6 +582,11 @@ const char * elf_error_msg(elf_error_t *);
  * Performs a binary search on sorted section headers.
  */
 bool elf_section_by_name(elfobj_t *, const char *, struct elf_section *);
+
+/*
+ * Outputs index of shdr searched by name
+ */
+bool elf_section_index_by_name(elfobj_t *, const char *, uint64_t *);
 
 /*
  * Fills in 'struct elf_section *' on success.
@@ -732,6 +763,23 @@ elf_reloc_type_string(elfobj_t *, uint32_t);
 bool
 elf_flags(elfobj_t *, elf_obj_flags_t);
 
+#if 0
+static inline uint64_t
+elf_error_code(elf_error_t e)
+{
+
+	return e._errno;
+}
+
+static inline bool
+elf_error_check(elf_error_t e, uint64_t code)
+{
+
+	if (elf_error_code(e) == code)
+		return true;
+	return false;
+}
+#endif
 /*
  * Get string tables
  */
@@ -826,6 +874,66 @@ elf_segment_count(elfobj_t *obj)
 	return 0;
 }
 
+static inline uint64_t
+elf_phoff(elfobj_t *obj)
+{
+
+	switch(obj->e_class) {
+	case elfclass32:
+		return obj->ehdr32->e_phoff;
+	case elfclass64:
+		return obj->ehdr64->e_phoff;
+	default:
+		break;
+	}
+	return 0;
+}
+
+static inline uint64_t
+elf_shoff(elfobj_t *obj)
+{
+
+	switch(obj->e_class) {
+	case elfclass32:
+		return obj->ehdr32->e_shoff;
+	case elfclass64:
+		return obj->ehdr64->e_shoff;
+	default:
+		break;
+	}
+	return 0;
+}
+
+static inline uint64_t
+elf_shnum(elfobj_t *obj)
+{
+
+	switch(obj->e_class) {
+	case elfclass32:
+		return obj->ehdr32->e_shnum;
+	case elfclass64:
+		return obj->ehdr64->e_shnum;
+	default:
+		break;
+	}
+	return 0;
+}
+
+static inline uint16_t
+elf_ehsize(elfobj_t *obj)
+{
+
+	switch(obj->e_class) {
+	case elfclass32:
+		return obj->ehdr32->e_ehsize;
+	case elfclass64:
+		return obj->ehdr64->e_ehsize;
+	default:
+		break;
+	}
+	return 0;
+}
+
 static inline size_t
 elf_section_count(elfobj_t *obj)
 {
@@ -840,7 +948,10 @@ size_t elf_ehdr_size(elfobj_t *);
  * Modify an elf_segment entry
  */
 bool elf_segment_by_index(elfobj_t *, uint64_t, struct elf_segment *);
-
+/*
+ * Will find the first ocurrence of a given p_type
+ */
+bool elf_segment_by_p_type(elfobj_t *, uint64_t, struct elf_segment *);
 /*
  * Write accessor functions.
  */
