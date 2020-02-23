@@ -55,6 +55,33 @@
 	    & (~(__alignof__ (struct cache_file_new) - 1)))
 
 bool
+elf_lxc_set_rootfs(elfobj_t *obj, const char *lxcpath)
+{
+	if ((obj->load_flags & ELF_LOAD_F_LXC_MODE) == false) {
+		return true;
+	}
+	if (setenv(ELF_LXC_ROOTFS_VAR, lxcpath, 1) == 0)
+		return true;
+	return false;
+}
+
+bool
+elf_lxc_get_rootfs(elfobj_t *obj, char *out, const size_t maxlen)
+{
+	char *v = secure_getenv(ELF_LXC_ROOTFS_VAR);
+
+	(void) obj;
+
+	if (maxlen > PATH_MAX)
+		return false;
+	if (strlen(v) > maxlen - 1)
+		return false;
+	strncpy(out, v, maxlen);
+	out[maxlen - 1] = '\0';
+	return true;
+}
+
+bool
 elf_symtab_count(elfobj_t *obj, uint64_t *count)
 {
 	struct elf_section section;
@@ -1520,17 +1547,17 @@ elf_shared_object_iterator_init(struct elfobj *obj,
 	}
 	iter->fd = open(cache_file, O_RDONLY);
 	if (iter->fd < 0) {
-		return elf_error_set(error, "open %s: %s", CACHE_FILE,
+		return elf_error_set(error, "open %s: %s", cache_file,
 		    strerror(errno));
 	}
 	if (fstat(iter->fd, &iter->st) < 0) {
-		return elf_error_set(error, "fstat %s: %s", CACHE_FILE,
+		return elf_error_set(error, "fstat %s: %s", cache_file,
 		    strerror(errno));
 	}
 	iter->mem = mmap(NULL, iter->st.st_size, PROT_READ, MAP_PRIVATE,
 	    iter->fd, 0);
 	if (iter->mem == MAP_FAILED) {
-		return elf_error_set(error, "mmap %s: %s", CACHE_FILE,
+		return elf_error_set(error, "mmap %s: %s", cache_file,
 		    strerror(errno));
 	}
 	iter->cache = iter->mem;
@@ -1690,7 +1717,7 @@ elf_shared_object_iterator_next(struct elf_shared_object_iterator *iter,
 			entry->basename = iter->current->basename;
 			iter->current = LIST_NEXT(iter->current, _linkage);
 
-			if (entry->path == NULL) {	
+			if (entry->path == NULL) {
 				return ELF_ITER_NOTFOUND;
 			}
 			if (ldso_insert_yield_cache(iter, entry->path) == false) {
@@ -1702,9 +1729,14 @@ elf_shared_object_iterator_next(struct elf_shared_object_iterator *iter,
 	}
 	entry->path = (char *)ldso_cache_bsearch(iter, iter->current->basename);
 	if (entry->path == NULL) {
-		elf_error_set(error, "ldso_cache_bsearch(%p, %s) failed",
+		// dependancy was not found on current system, return expected values
+		// to point to next dependancy while informing caller that it was just NOTFOUND
+		elf_error_set(error, "ldso_cache_bsearch(%p, %s) failed to find",
 		    iter, iter->current->basename);
-		goto err;
+		entry->path = iter->current->path;
+		entry->basename = iter->current->basename;
+		iter->current = LIST_NEXT(iter->current, _linkage);
+		return ELF_ITER_NOTFOUND;
 	}
 
 next_basename:
